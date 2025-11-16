@@ -12,6 +12,7 @@ from typing import Optional
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
+from helpers.max_hold_rule import evaluate_max_holding_rule
 from helpers.lark_bot import LarkBot
 from helpers.telegram_bot import TelegramBot
 
@@ -32,6 +33,7 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    max_hold_minutes: int = 0
 
     @property
     def close_order_side(self) -> str:
@@ -81,6 +83,8 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        self.position_open_time = None
+        self.current_position_amt = Decimal(0)
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -380,6 +384,7 @@ class TradingBot:
 
                 # Get positions
                 position_amt = await self.exchange_client.get_account_positions()
+                self.current_position_amt = position_amt
 
                 # Calculate active closing amount
                 active_close_amount = sum(
@@ -487,6 +492,91 @@ class TradingBot:
             with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
                 tg_bot.send_text(message)
 
+    async def _check_and_handle_max_holding_time(self) -> bool:
+        """
+        Check the max holding time rule and, if exceeded, force close the current
+        position and reopen a new one.
+
+        Returns True if a force-close-and-reopen action was performed.
+        """
+        max_hold_minutes = getattr(self.config, "max_hold_minutes", 0)
+
+        # Always keep internal timer in sync with current position state
+        self.position_open_time, should_force_close = evaluate_max_holding_rule(
+            self.current_position_amt,
+            self.position_open_time,
+            max_hold_minutes,
+        )
+
+        # Rule disabled or no need to act
+        if max_hold_minutes <= 0 or not should_force_close or self.current_position_amt <= 0:
+            return False
+
+        self.logger.log(
+            f"Max holding time exceeded ({max_hold_minutes} minutes). "
+            f"Forcing close of position size {self.current_position_amt} and reopening.",
+            "WARNING",
+        )
+
+        try:
+            # Cancel all existing close orders to avoid mismatches
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            for order in active_orders:
+                if order.side == self.config.close_order_side:
+                    try:
+                        await self.exchange_client.cancel_order(order.order_id)
+                    except Exception as cancel_error:
+                        self.logger.log(
+                            f"Error cancelling close order {order.order_id} during max-hold handling: {cancel_error}",
+                            "ERROR",
+                        )
+
+            # Re-fetch the latest position amount before closing
+            position_amt = await self.exchange_client.get_account_positions()
+            if position_amt <= 0:
+                self.position_open_time = None
+                self.current_position_amt = position_amt
+                return False
+
+            close_side = self.config.close_order_side
+
+            # Try to close the position with a market order
+            try:
+                close_result = await self.exchange_client.place_market_order(
+                    self.config.contract_id,
+                    position_amt,
+                    close_side,
+                )
+            except AttributeError:
+                # Some exchanges may not implement place_market_order
+                self.logger.log(
+                    "Exchange does not support market close for max-hold rule; skipping force close.",
+                    "ERROR",
+                )
+                return False
+
+            if not close_result.success:
+                self.logger.log(
+                    f"Failed to force close position by max-hold rule: {close_result.error_message}",
+                    "ERROR",
+                )
+                return False
+
+            # Reset tracking after successful close
+            self.position_open_time = None
+            self.current_position_amt = Decimal(0)
+
+            # Immediately open a new grid position using existing logic
+            await self._place_and_monitor_open_order()
+            self.last_close_orders += 1
+
+            return True
+
+        except Exception as e:
+            self.logger.log(f"Error while applying max-hold rule: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            return False
+
     async def run(self):
         """Main trading loop."""
         try:
@@ -506,6 +596,7 @@ class TradingBot:
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
+            self.logger.log(f"Max Hold Minutes: {self.config.max_hold_minutes}", "INFO")
             self.logger.log("=============================", "INFO")
 
             # Capture the running event loop for thread-safe callbacks
@@ -548,6 +639,11 @@ class TradingBot:
                     continue
 
                 if not mismatch_detected:
+                    # Apply max holding time rule if configured
+                    handled_by_max_hold = await self._check_and_handle_max_holding_time()
+                    if handled_by_max_hold:
+                        continue
+
                     wait_time = self._calculate_wait_time()
 
                     if wait_time > 0:

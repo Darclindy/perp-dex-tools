@@ -49,6 +49,8 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    parser.add_argument('--max-hold-minutes', type=int, default=0,
+                        help='Maximum holding time for a position in minutes (0 disables the limit)')
 
     return parser.parse_args()
 
@@ -102,7 +104,7 @@ async def main():
         sys.exit(1)
     dotenv.load_dotenv(args.env_file)
 
-    # Create configuration
+    # Create configuration (shared across restarts)
     config = TradingConfig(
         ticker=args.ticker.upper(),
         contract_id='',  # will be set in the bot's run method
@@ -116,17 +118,28 @@ async def main():
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
         pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        max_hold_minutes=args.max_hold_minutes
     )
 
-    # Create and run the bot
-    bot = TradingBot(config)
-    try:
-        await bot.run()
-    except Exception as e:
-        print(f"Bot execution failed: {e}")
-        # The bot's run method already handles graceful shutdown
-        return
+    # Automatically restart the bot; only Ctrl+C or fatal config issues exit the script
+    while True:
+        bot = TradingBot(config)
+        try:
+            await bot.run()
+        except KeyboardInterrupt:
+            print("Received KeyboardInterrupt. Exiting...")
+            break
+        except BaseException as e:
+            # Catch all runtime failures (including SystemExit raised inside libraries)
+            print(f"Bot execution failed: {e}")
+            print("Bot will restart in 5 seconds...")
+            await asyncio.sleep(5)
+            continue
+
+        # Normal exit (e.g. stop-price triggered, internal graceful_shutdown, mismatch etc.)
+        print("Bot stopped without exception. Restarting in 5 seconds... Press Ctrl+C to exit.")
+        await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

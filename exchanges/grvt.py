@@ -5,10 +5,11 @@ GRVT exchange client implementation.
 import os
 import asyncio
 import time
+from functools import partial
 from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
 from pysdk.grvt_ccxt import GrvtCcxt
-from pysdk.grvt_ccxt_ws import GrvtCcxtWS
+from .grvt_ws import StableGrvtWS
 from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
@@ -95,7 +96,7 @@ class GrvtClient(BaseExchangeClient):
                 'private_key': self.private_key
             }
 
-            self._ws_client = GrvtCcxtWS(
+            self._ws_client = StableGrvtWS(
                 env=self.env,
                 loop=loop,
                 logger=logger,  # Add logger parameter like in test file
@@ -234,8 +235,10 @@ class GrvtClient(BaseExchangeClient):
     @query_retry(reraise=True)
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
         """Fetch best bid and offer prices for a contract."""
-        # Get order book from GRVT
-        order_book = self.rest_client.fetch_order_book(contract_id, limit=10)
+        # Get order book from GRVT (run in thread to avoid blocking event loop)
+        order_book = await asyncio.to_thread(
+            partial(self.rest_client.fetch_order_book, contract_id, limit=10)
+        )
 
         if not order_book or 'bids' not in order_book or 'asks' not in order_book:
             raise ValueError(f"Unable to get order book: {order_book}")
@@ -252,16 +255,19 @@ class GrvtClient(BaseExchangeClient):
                                     side: str) -> OrderResult:
         """Place a post only order with GRVT using official SDK."""
 
-        # Place the order using GRVT SDK
-        order_result = self.rest_client.create_limit_order(
-            symbol=contract_id,
-            side=side,
-            amount=quantity,
-            price=price,
-            params={
-                'post_only': True,
-                'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
-            }
+        # Place the order using GRVT SDK (run in thread)
+        order_result = await asyncio.to_thread(
+            partial(
+                self.rest_client.create_limit_order,
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=price,
+                params={
+                    'post_only': True,
+                    'order_duration_secs': 30 * 86400 - 1,
+                },
+            )
         )
         if not order_result:
             raise Exception(f"[OPEN] Error placing order")
@@ -412,8 +418,10 @@ class GrvtClient(BaseExchangeClient):
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with GRVT."""
         try:
-            # Cancel the order using GRVT SDK
-            cancel_result = self.rest_client.cancel_order(id=order_id)
+            # Cancel the order using GRVT SDK (run in thread)
+            cancel_result = await asyncio.to_thread(
+                partial(self.rest_client.cancel_order, id=order_id)
+            )
 
             if cancel_result:
                 return OrderResult(success=True)
@@ -426,11 +434,15 @@ class GrvtClient(BaseExchangeClient):
     @query_retry(reraise=True)
     async def get_order_info(self, order_id: str = None, client_order_id: str = None) -> Optional[OrderInfo]:
         """Get order information from GRVT."""
-        # Get order information using GRVT SDK
+        # Get order information using GRVT SDK (run in thread)
         if order_id is not None:
-            order_data = self.rest_client.fetch_order(id=order_id)
+            order_data = await asyncio.to_thread(
+                partial(self.rest_client.fetch_order, id=order_id)
+            )
         elif client_order_id is not None:
-            order_data = self.rest_client.fetch_order(params={'client_order_id': client_order_id})
+            order_data = await asyncio.to_thread(
+                partial(self.rest_client.fetch_order, params={'client_order_id': client_order_id})
+            )
         else:
             raise ValueError("Either order_id or client_order_id must be provided")
 
@@ -469,8 +481,10 @@ class GrvtClient(BaseExchangeClient):
     @query_retry(reraise=True)
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
         """Get active orders for a contract."""
-        # Get active orders using GRVT SDK
-        orders = self.rest_client.fetch_open_orders(symbol=contract_id)
+        # Get active orders using GRVT SDK (run in thread)
+        orders = await asyncio.to_thread(
+            partial(self.rest_client.fetch_open_orders, symbol=contract_id)
+        )
 
         if not orders:
             return []
@@ -501,8 +515,8 @@ class GrvtClient(BaseExchangeClient):
     @query_retry(reraise=True)
     async def get_account_positions(self) -> Decimal:
         """Get account positions."""
-        # Get positions using GRVT SDK
-        positions = self.rest_client.fetch_positions()
+        # Get positions using GRVT SDK (run in thread)
+        positions = await asyncio.to_thread(self.rest_client.fetch_positions)
 
         for position in positions:
             if position.get('instrument') == self.config.contract_id:
@@ -516,8 +530,8 @@ class GrvtClient(BaseExchangeClient):
         if not ticker:
             raise ValueError("Ticker is empty")
 
-        # Get markets from GRVT
-        markets = self.rest_client.fetch_markets()
+        # Get markets from GRVT (run in thread)
+        markets = await asyncio.to_thread(self.rest_client.fetch_markets)
 
         for market in markets:
             if (market.get('base') == ticker and
